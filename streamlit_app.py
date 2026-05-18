@@ -5,7 +5,7 @@ from huggingface_hub import HfFileSystem
 import config
 from us_calendar import next_trading_day
 
-st.set_page_config(page_title="Continual Rehearsal", layout="wide")
+st.set_page_config(page_title="Continual Rehearsal Engine", layout="wide")
 st.markdown("""
 <style>
     .main-header { font-size: 2.5rem; font-weight: 700; color: #1f77b4; margin-bottom: 0.5rem; }
@@ -18,16 +18,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">🔄 Continual Rehearsal Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Experience replay or EWC | Prevents catastrophic forgetting | Online MLP update</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Experience Replay / Elastic Weight Consolidation | Catastrophic forgetting prevention | Multi‑window selection</div>', unsafe_allow_html=True)
 
-st.sidebar.markdown("## 🔄 Continual")
+st.sidebar.markdown("## 🔄 Continual Rehearsal")
 st.sidebar.markdown(f"**Run Date:** `{st.session_state.get('run_date', 'Not loaded')}`")
 st.sidebar.markdown(f"**Next Trading Day:** `{next_trading_day()}`")
 st.sidebar.markdown(f"**Method:** {config.METHOD}")
-if config.METHOD == "replay":
-    st.sidebar.markdown(f"**Buffer size:** {config.REPLAY_BUFFER_SIZE}")
-else:
-    st.sidebar.markdown(f"**EWC λ:** {config.EWC_LAMBDA}")
+st.sidebar.markdown(f"**Replay buffer size:** {config.REPLAY_BUFFER_SIZE}")
+st.sidebar.markdown(f"**EWC lambda:** {config.EWC_LAMBDA}")
+st.sidebar.markdown("**Windows evaluated:** 63, 252, 504, 1008, 2016 days (best per ETF)")
 
 OUTPUT_REPO = config.OUTPUT_REPO
 HF_TOKEN = config.HF_TOKEN
@@ -42,7 +41,7 @@ def list_repo_files():
         return [f"Error: {e}"]
 
 def find_latest_json(files):
-    json_files = [f for f in files if f.endswith('.json') and 'continual_rehearsal_' in f]
+    json_files = [f for f in files if f.endswith('.json') and 'continual_' in f]
     if not json_files:
         return None
     json_files.sort(reverse=True)
@@ -71,7 +70,7 @@ if "error" in data:
 st.session_state['run_date'] = data['run_date']
 universes = data["universes"]
 
-st.header("🏆 Top ETFs by Continual Learning Prediction")
+st.header("🏆 Top ETFs by Continual Learning Predicted Return")
 
 for universe_name, uni_data in universes.items():
     top_etfs = uni_data.get("top_etfs", [])
@@ -85,14 +84,25 @@ for universe_name, uni_data in universes.items():
             <div class="etf-card">
                 <div class="etf-ticker">{etf['ticker']}</div>
                 <div class="etf-score">pred return = {etf['pred_return']:.6f}</div>
+                <div class="etf-score">best window = {etf.get('best_window', 'N/A')}d</div>
             </div>
             """, unsafe_allow_html=True)
-    with st.expander("📋 Full ranking (all ETFs)"):
+    with st.expander("📋 Full ranking (all ETFs, best window per ETF)"):
         full = uni_data.get("full_scores", {})
         if full:
-            df = pd.DataFrame(list(full.items()), columns=["ETF", "Predicted Return"])
-            df = df.sort_values("Predicted Return", ascending=False)
+            rows = []
+            for ticker, info in full.items():
+                if isinstance(info, dict):
+                    score = info.get("score", 0.0)
+                    win = info.get("best_window", "N/A")
+                else:
+                    score = info
+                    win = "N/A"
+                rows.append({"ETF": ticker, "Predicted Return": score, "Best Window": win})
+            df = pd.DataFrame(rows)
+            df["Predicted Return"] = pd.to_numeric(df["Predicted Return"], errors='coerce')
+            df = df.dropna(subset=["Predicted Return"]).sort_values("Predicted Return", ascending=False)
             st.dataframe(df, use_container_width=True, hide_index=True)
     st.divider()
 
-st.caption("A simple MLP is trained sequentially on days of data. Experience Replay stores past samples and replays them to avoid forgetting. EWC penalises changes to important parameters. Higher predicted return → stronger long signal.")
+st.caption("The model is trained continually on sequentially arriving data, using Experience Replay or Elastic Weight Consolidation (EWC) to avoid catastrophic forgetting. For each ETF, the window giving the highest predicted return is selected.")
