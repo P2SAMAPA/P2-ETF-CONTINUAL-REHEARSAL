@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 from datetime import datetime
 import torch
+import torch.nn as nn
 import config
 import data_manager
 from continual_model import ContinualLearner
@@ -44,22 +45,18 @@ def train_continual_model(returns_df, macro_df, etf, window, method='replay', bu
     macro_win = macro_win.loc[common]
     lookback = 5
     X_list, y_list = [], []
-    for i in range(lookback, len(ret_win)):
+    for i in range(lookback, len(ret_win)-1):
         X_row = [ret_win[etf].iloc[i-lag] for lag in range(1, lookback+1)]
         X_row.extend(macro_win.iloc[i].values)
         X_list.append(X_row)
-        y_list.append(ret_win[etf].iloc[i+1] if i+1 < len(ret_win) else 0.0)
+        y_list.append(ret_win[etf].iloc[i+1])
     if len(X_list) < 10:
         return 0.0
     X = np.array(X_list)
     y = np.array(y_list)
     input_dim = X.shape[1]
     learner = ContinualLearner(input_dim, method=method, replay_buffer_size=buffer_size, ewc_lambda=ewc_lambda)
-    # Train sequentially over all samples (one batch per day? we'll train on the whole dataset)
-    # For simplicity, train on all data in one go (but that defeats continual learning). Instead, we train in mini‑batches.
-    # We'll use the entire set for training but we can iterate.
-    # Here we just train on the whole set normally (not continual) for speed.
-    # For true continual, we would process one day at a time. But we'll implement as a single batch.
+    # Train on all data (not truly continual, but for simplicity)
     X_t = torch.tensor(X, dtype=torch.float32).to(learner.device)
     y_t = torch.tensor(y, dtype=torch.float32).to(learner.device)
     learner.model.train()
@@ -68,7 +65,6 @@ def train_continual_model(returns_df, macro_df, etf, window, method='replay', bu
     loss = nn.MSELoss()(outputs, y_t)
     loss.backward()
     learner.optimizer.step()
-    # Predict for the most recent feature vector (the last day)
     last_X = X[-1:].reshape(1, -1)
     pred = learner.predict(last_X)
     return pred
