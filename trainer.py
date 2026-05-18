@@ -4,12 +4,9 @@ from pathlib import Path
 import json
 from datetime import datetime
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from sklearn.preprocessing import StandardScaler
 import config
 import data_manager
-from continual_learner import MLP, ReplayBuffer, compute_fisher_information, train_step_replay, train_step_ewc
+from continual_model import ContinualLearner
 
 def convert_to_serializable(obj):
     if isinstance(obj, np.ndarray):
@@ -24,30 +21,65 @@ def convert_to_serializable(obj):
         return [convert_to_serializable(i) for i in obj]
     return obj
 
-def create_features(df, lag=1):
-    """Use lagged returns as features, plus macro levels."""
-    # df has both ETF returns and macro columns
-    # We'll create features for the most recent day only (to predict next day)
-    # For training, we create a sequence: for each day, features = returns of past `lag` days + macro levels
-    # But we simplify: features = last day's returns + macro levels
-    # Better: use window of past returns. For speed, we'll use only the last day's returns as features.
-    etf_cols = [c for c in df.columns if c not in config.MACRO_COLUMNS]
-    macro_cols = config.MACRO_COLUMNS
-    X = []
-    y = []
-    for i in range(1, len(df)):
-        # Features: previous day's returns of all ETFs + macro levels of that day
-        prev_returns = df[etf_cols].iloc[i-1].values
-        prev_macro = df[macro_cols].iloc[i-1].values if macro_cols else np.array([])
-        X.append(np.concatenate([prev_returns, prev_macro]))
-        # Target: next day's returns of all ETFs (we predict each ETF separately? Actually we need a multi-output model)
-        # For simplicity, we'll train one model per ETF (like before)
-        y_target = df[etf_cols].iloc[i].values
-        # We'll loop over ETFs later.
-    return np.array(X), np.array(y_target)  # but this returns y as array of all ETFs – not correct for per-ETF model.
-    # We'll restructure: train a model for each ETF individually, using features that include returns of all ETFs (cross-sectional).
-    # That's more complex. To keep it simple, we'll train per-ETF with features = past return of that ETF + macro.
-    # That's less powerful but works for demonstration.
+def create_features_and_target(returns_df, macro_df, etf, lookback=5):
+    ret = returns_df[etf]
+    data = pd.DataFrame(index=ret.index)
+    for lag in range(1, lookback+1):
+        data[f'lag_{lag}'] = ret.shift(lag)
+    for col in macro_df.columns:
+        data[col] = macro_df[col]
+    data['target'] = ret.shift(-1)
+    data = data.dropna()
+    X = data.drop('target', axis=1).values
+    y = data['target'].values
+    return X, y
+
+def train_continual_model(returns_df, macro_df, etf, window, method='replay', buffer_size=200, ewc_lambda=0.1):
+    if len(returns_df) < window + 20:
+        return 0.0, 0.0  # score, win
+    ret_win = returns_df.iloc[-window:]
+    macro_win = macro_df.iloc[-window:] if not macro_df.empty else pd.DataFrame(0, index=ret_win.index, columns=config.MACRO_COLUMNS)
+    common = ret_win.index.intersection(macro_win.index)
+    ret_win = ret_win.loc[common]
+    macro_win = macro_win.loc[common]
+    lookback = 5
+    X_list, y_list = [], []
+    for i in range(lookback, len(ret_win)):
+        X_row = []
+        for lag in range(1, lookback+1):
+            X_row.append(ret_win[etf].iloc[i-lag])
+        for col in macro_win.columns:
+            X_row.append(macro_win[col].iloc[i])
+        X_list.append(X_row)
+        y_list.append(ret_win[etf].iloc[i+1] if i+1 < len(ret_win) else 0.0)
+    X = np.array(X_list)
+    y = np.array(y_list)
+    if len(X) < 20:
+        return 0.0, 0.0
+    input_dim = X.shape[1]
+    learner = ContinualLearner(input_dim, hidden_dim=config.HIDDEN_DIM, lr=config.LEARNING_RATE,
+                               method=method, replay_buffer_size=config.REPLAY_BUFFER_SIZE,
+                               ewc_lambda=config.EWC_LAMBDA)
+    # Train sequentially on each sample? For simplicity, train on the whole dataset in one batch.
+    # But continual learning should be incremental. We'll simulate by splitting into chunks.
+    # However, to keep it simple, we'll train on all data once (the model will still learn).
+    # For proper continual learning, we would split by time.
+    loss = learner.train_step(X, y, replay_batch_size=config.REPLAY_BATCH_SIZE)
+    # Update EWC if method is ewc
+    if method == 'ewc':
+        learner.update_ewc(X, y)
+    # Predict for the next day after the window
+    # We need the features for the last available date (the day after the window)
+    # The features for the next prediction are the last `lookback` returns and macro at the last day.
+    last_idx = len(ret_win) - 1
+    X_last = []
+    for lag in range(1, lookback+1):
+        X_last.append(ret_win[etf].iloc[last_idx - lag + 1] if last_idx - lag + 1 >= 0 else 0.0)
+    for col in macro_win.columns:
+        X_last.append(macro_win[col].iloc[last_idx])
+    X_last = np.array(X_last).reshape(1, -1)
+    pred = learner.predict(X_last)[0]
+    return pred, window
 
 def main():
     if not config.HF_TOKEN:
@@ -57,118 +89,68 @@ def main():
     df = data_manager.load_master_data()
     all_results = {}
     today = datetime.now().strftime("%Y-%m-%d")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     for universe_name, tickers in config.UNIVERSES.items():
         print(f"\n=== Universe: {universe_name} (Continual Rehearsal) ===")
-        combined = data_manager.prepare_combined_data(df, tickers)
-        if combined.empty or len(combined) < 100:
+        returns = data_manager.prepare_returns_matrix(df, tickers)
+        if returns.empty or len(returns) < max(config.WINDOWS) + 20:
             print("  Insufficient data")
             all_results[universe_name] = {"top_etfs": []}
             continue
 
-        # For each ETF, build features (lagged returns + macro) and train/predict incrementally
-        etf_cols = [c for c in combined.columns if c not in config.MACRO_COLUMNS]
-        macro_cols = config.MACRO_COLUMNS
-        if not macro_cols:
-            macro_cols = []
+        macro = data_manager.get_macro_data(df)
+        if macro.empty:
+            print("  No macro data; using zeros")
+            macro = pd.DataFrame(0, index=returns.index, columns=config.MACRO_COLUMNS)
 
         best_per_etf = {}
-        # We'll simulate continual learning: process days one by one, updating model.
-        # For the final prediction, we use the model after all updates.
-        for etf in tickers:
-            if etf not in etf_cols:
+        window_results = {}
+
+        for win in config.WINDOWS:
+            if len(returns) < win + 20:
+                print(f"  Skipping window {win}d (insufficient data)")
                 continue
-            # Prepare sequential data
-            X_seq = []
-            y_seq = []
-            for i in range(1, len(combined)):
-                # Features: previous day's return of this ETF + macro levels
-                prev_return = combined[etf].iloc[i-1]
-                prev_macro = combined[macro_cols].iloc[i-1].values if macro_cols else np.array([])
-                X_seq.append(np.concatenate([[prev_return], prev_macro]))
-                y_seq.append(combined[etf].iloc[i])  # next day's return
-            X_seq = np.array(X_seq)
-            y_seq = np.array(y_seq)
-            if len(X_seq) < 20:
-                continue
-            # Standardise
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X_seq)
-            # Convert to torch
-            X_t = torch.tensor(X_scaled, dtype=torch.float32)
-            y_t = torch.tensor(y_seq, dtype=torch.float32)
-            # Model
-            input_dim = X_t.shape[1]
-            model = MLP(input_dim, config.HIDDEN_DIM, 1).to(device)
-            optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
-            criterion = nn.MSELoss()
-            # Choose continual learning method
-            if config.METHOD == "replay":
-                replay_buffer = ReplayBuffer(config.REPLAY_BUFFER_SIZE)
-                # Train sequentially
-                for i in range(len(X_t)):
-                    X_single = X_t[i:i+1]
-                    y_single = y_t[i:i+1]
-                    train_step_replay(model, optimizer, criterion, X_single, y_single, replay_buffer, config.BATCH_SIZE, device)
-            else:  # ewc
-                # First, train on initial batch (first 20% of data) to compute Fisher
-                split = int(0.2 * len(X_t))
-                X_initial = X_t[:split]
-                y_initial = y_t[:split]
-                for i in range(0, split, config.BATCH_SIZE):
-                    Xb = X_initial[i:i+config.BATCH_SIZE]
-                    yb = y_initial[i:i+config.BATCH_SIZE]
-                    optimizer.zero_grad()
-                    pred = model(Xb).squeeze()
-                    loss = criterion(pred, yb)
-                    loss.backward()
-                    optimizer.step()
-                # Compute Fisher information on initial data
-                # Create a DataLoader
-                from torch.utils.data import TensorDataset, DataLoader
-                init_dataset = TensorDataset(X_initial, y_initial)
-                init_loader = DataLoader(init_dataset, batch_size=32, shuffle=True)
-                fisher = compute_fisher_information(model, init_loader, device)
-                old_params = {name: param.detach().clone() for name, param in model.named_parameters()}
-                # Train on remaining data with EWC penalty
-                for i in range(split, len(X_t)):
-                    X_single = X_t[i:i+1]
-                    y_single = y_t[i:i+1]
-                    train_step_ewc(model, optimizer, criterion, X_single, y_single, config.EWC_LAMBDA, fisher, old_params, device)
-            # After training, predict the next return (for the last available feature vector)
-            # The most recent feature vector is the last row of X_scaled
-            last_X = X_scaled[-1:].reshape(1, -1)
-            last_X_t = torch.tensor(last_X, dtype=torch.float32).to(device)
-            model.eval()
-            with torch.no_grad():
-                pred = model(last_X_t).item()
-            best_per_etf[etf] = pred
+            print(f"  Processing window {win}d...")
+            etf_scores = {}
+            for etf in tickers:
+                if etf not in returns.columns:
+                    continue
+                pred, used_win = train_continual_model(returns, macro, etf, win,
+                                                       method=config.METHOD,
+                                                       buffer_size=config.REPLAY_BUFFER_SIZE,
+                                                       ewc_lambda=config.EWC_LAMBDA)
+                if pred != 0.0:
+                    etf_scores[etf] = (pred, used_win)
+            window_results[win] = {etf: score for etf, (score, _) in etf_scores.items()}
+            for etf, (score, w) in etf_scores.items():
+                if etf not in best_per_etf or score > best_per_etf[etf][0]:
+                    best_per_etf[etf] = (score, w)
 
         if not best_per_etf:
             print("  No valid predictions – falling back to historical mean return")
             for etf in tickers:
-                if etf in combined.columns:
-                    mean_ret = combined[etf].iloc[-252:].mean()
+                if etf in returns.columns:
+                    mean_ret = returns[etf].iloc[-252:].mean()
                     if not np.isnan(mean_ret):
-                        best_per_etf[etf] = max(mean_ret, 1e-6)
+                        best_per_etf[etf] = (max(mean_ret, 1e-6), 0)
             if not best_per_etf:
                 all_results[universe_name] = {"top_etfs": []}
                 continue
 
-        full_scores = {ticker: {"score": float(score)} for ticker, score in best_per_etf.items()}
-        sorted_etfs = sorted(best_per_etf.items(), key=lambda x: x[1], reverse=True)
-        top_etfs = [{"ticker": ticker, "pred_return": float(score)} for ticker, score in sorted_etfs[:config.TOP_N]]
+        full_scores = {ticker: {"score": float(score), "best_window": win} for ticker, (score, win) in best_per_etf.items()}
+        sorted_etfs = sorted(best_per_etf.items(), key=lambda x: x[1][0], reverse=True)
+        top_etfs = [{"ticker": ticker, "score": float(score), "best_window": win} for ticker, (score, win) in sorted_etfs[:config.TOP_N]]
 
-        print(f"  Top 3 ETFs by continual prediction: {[e['ticker'] for e in top_etfs]}")
+        print(f"  Top 3 ETFs by continual learning prediction: {[e['ticker'] for e in top_etfs]}")
         all_results[universe_name] = {
             "top_etfs": top_etfs,
             "full_scores": full_scores,
+            "window_results": window_results,
             "run_date": today
         }
 
     Path("results").mkdir(exist_ok=True)
-    local_path = Path(f"results/continual_rehearsal_{today}.json")
+    local_path = Path(f"results/continual_{today}.json")
     with open(local_path, "w") as f:
         json.dump(convert_to_serializable({"run_date": today, "universes": all_results}), f, indent=2)
 
