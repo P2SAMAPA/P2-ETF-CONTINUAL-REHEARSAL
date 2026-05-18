@@ -5,7 +5,7 @@ from huggingface_hub import HfFileSystem
 import config
 from us_calendar import next_trading_day
 
-st.set_page_config(page_title="Continual Rehearsal", layout="wide")
+st.set_page_config(page_title="Continual Rehearsal Engine", layout="wide")
 st.markdown("""
 <style>
     .main-header { font-size: 2.5rem; font-weight: 700; color: #1f77b4; margin-bottom: 0.5rem; }
@@ -18,16 +18,12 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">🔄 Continual Rehearsal Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Experience Replay / Elastic Weight Consolidation (EWC) | Catastrophic forgetting prevention | Multi‑window best selection</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Experience Replay / EWC | Catastrophic forgetting prevention | Multi‑window evaluation</div>', unsafe_allow_html=True)
 
 st.sidebar.markdown("## 🔄 Continual Rehearsal")
 st.sidebar.markdown(f"**Run Date:** `{st.session_state.get('run_date', 'Not loaded')}`")
 st.sidebar.markdown(f"**Next Trading Day:** `{next_trading_day()}`")
 st.sidebar.markdown(f"**Method:** {config.METHOD}")
-if config.METHOD == "replay":
-    st.sidebar.markdown(f"**Buffer size:** {config.REPLAY_BUFFER_SIZE}")
-else:
-    st.sidebar.markdown(f"**EWC λ:** {config.EWC_LAMBDA}")
 st.sidebar.markdown("**Windows evaluated:** 63, 252, 504, 1008, 2016 days (best per ETF)")
 
 OUTPUT_REPO = config.OUTPUT_REPO
@@ -81,12 +77,19 @@ for universe_name, uni_data in universes.items():
     st.markdown(f'<div class="universe-title">{universe_name.replace("_", " ").title()}</div>', unsafe_allow_html=True)
     cols = st.columns(3)
     for idx, etf in enumerate(top_etfs):
+        # Use .get to handle different key names
+        score_key = 'score' if 'score' in etf else ('pred_return' if 'pred_return' in etf else None)
+        if score_key is None:
+            st.error(f"Unknown key in ETF data: {etf.keys()}")
+            continue
+        score = etf[score_key]
+        best_window = etf.get('best_window', 'N/A')
         with cols[idx]:
             st.markdown(f"""
             <div class="etf-card">
                 <div class="etf-ticker">{etf['ticker']}</div>
-                <div class="etf-score">pred return = {etf['score']:.6f}</div>
-                <div class="etf-score">best window = {etf.get('best_window', 'N/A')}d</div>
+                <div class="etf-score">pred return = {score:.6f}</div>
+                <div class="etf-score">best window = {best_window}d</div>
             </div>
             """, unsafe_allow_html=True)
     with st.expander("📋 Full ranking (all ETFs, best window per ETF)"):
@@ -95,7 +98,7 @@ for universe_name, uni_data in universes.items():
             rows = []
             for ticker, info in full.items():
                 if isinstance(info, dict):
-                    score = info.get("score", 0.0)
+                    score = info.get("score", info.get("pred_return", 0.0))
                     win = info.get("best_window", "N/A")
                 else:
                     score = info
@@ -107,4 +110,4 @@ for universe_name, uni_data in universes.items():
             st.dataframe(df, use_container_width=True, hide_index=True)
     st.divider()
 
-st.caption("The model is trained sequentially over the rolling window, using experience replay (or EWC) to avoid forgetting. For each ETF, the window that gives the highest predicted return is selected.")
+st.caption("The model is trained sequentially on rolling windows, using Experience Replay or Elastic Weight Consolidation to avoid forgetting past patterns. Higher predicted return → stronger long signal. For each ETF, the window giving the highest predicted return is selected.")
