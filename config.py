@@ -19,19 +19,22 @@ UNIVERSES = {
 
 MACRO_COLUMNS = ["VIX", "DXY", "T10Y2Y", "TBILL_3M", "IG_SPREAD", "HY_SPREAD"]
 
-# Model hyperparameters
-HIDDEN_DIM = 64
-LEARNING_RATE = 1e-3
-BATCH_SIZE = 32
+# Rolling windows (days)
+WINDOWS = [63, 252, 504, 1008, 2016]
 
 # Continual learning method: "replay" or "ewc"
 METHOD = "replay"
 
-# Replay buffer size (number of past samples to store)
-REPLAY_BUFFER_SIZE = 1000
+# Experience replay parameters
+REPLAY_BUFFER_SIZE = 200
+REPLAY_BATCH_SIZE = 32
 
-# EWC hyperparameters
-EWC_LAMBDA = 1000   # strength of the regularization term
-EWC_FISHER_SAMPLES = 100
+# EWC parameters
+EWC_LAMBDA = 0.1
+
+# Model hyperparameters
+HIDDEN_DIM = 64
+LEARNING_RATE = 1e-3
+EPOCHS_PER_BATCH = 1
 
 TOP_N = 3
